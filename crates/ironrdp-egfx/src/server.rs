@@ -1725,7 +1725,9 @@ impl GraphicsPipelineServer {
     /// Queue an H.264 AVC444 frame for transmission with a typed rejection.
     ///
     /// AVC444 uses two streams: luma (Y) and chroma (UV). Set `chroma_data` to
-    /// `None` for luma-only transmission.
+    /// `None` for luma-only transmission. When both are present, V1 sends LC 1
+    /// followed by LC 2 inside one graphics frame. This preserves the coded
+    /// sequence and avoids a dual-view wrapper rejected by Windows App 11.4.3.
     pub fn try_send_avc444_frame(
         &mut self,
         surface_id: u16,
@@ -1861,11 +1863,15 @@ impl GraphicsPipelineServer {
         let surface = self.prepare_submission(surface_id, true)?;
         let timestamp = Self::make_timestamp(timestamp_ms);
         let frame_id = self.frames.begin_frame(timestamp);
-        let wire_pdu = Self::avc444_wire_pdu(codec_id, &surface, encoding, (stream1_regions, stream1_data), stream2);
+        let (main_pdu, chroma_pdu) =
+            Self::avc444_wire_pdus(codec_id, &surface, encoding, (stream1_regions, stream1_data), stream2);
 
         self.output_queue
             .push_back(GfxPdu::StartFrame(StartFramePdu { timestamp, frame_id }));
-        self.output_queue.push_back(GfxPdu::WireToSurface1(wire_pdu));
+        self.output_queue.push_back(GfxPdu::WireToSurface1(main_pdu));
+        if let Some(chroma_pdu) = chroma_pdu {
+            self.output_queue.push_back(GfxPdu::WireToSurface1(chroma_pdu));
+        }
         self.output_queue.push_back(GfxPdu::EndFrame(EndFramePdu { frame_id }));
 
         Ok(frame_id)
@@ -1921,10 +1927,49 @@ impl GraphicsPipelineServer {
         }
     }
 
-    /// Build the `WireToSurface1` PDU for an AVC444 or AVC444v2 mixed-frame tile
-    /// whose shape has already been checked.
-    fn avc444_tile_pdu(codec_id: Codec1Type, surface: &Surface, tile: &Avc444Tile) -> WireToSurface1Pdu {
-        Self::avc444_wire_pdu(
+    /// Encode V1's two views separately while retaining the caller's frame boundary.
+    ///
+    /// [MS-RDPEGFX 2.2.4.5] permits LC 1 (main) followed by LC 2 (auxiliary,
+    /// combined with cached main). Windows App 11.4.3 accepts this ordered pair
+    /// but rejects the same coded pictures in one LC 0 wrapper. Each view keeps
+    /// its own regions and borrows its coded data until the final PDU is encoded.
+    /// AVC444v2 retains its existing wrapper and view layout.
+    ///
+    /// [MS-RDPEGFX 2.2.4.5]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpegfx/844018a5-d717-4bc9-bddb-8b4d6be5dd3f
+    fn avc444_wire_pdus<'a>(
+        codec_id: Codec1Type,
+        surface: &Surface,
+        encoding: Encoding,
+        stream1: (&[Avc420Region], &'a [u8]),
+        stream2: Option<(&[Avc420Region], &'a [u8])>,
+    ) -> (WireToSurface1Pdu, Option<WireToSurface1Pdu>) {
+        if codec_id == Codec1Type::Avc444 && encoding == Encoding::LUMA_AND_CHROMA {
+            if let Some(stream2) = stream2 {
+                return (
+                    Self::avc444_wire_pdu(codec_id, surface, Encoding::LUMA, stream1, None),
+                    Some(Self::avc444_wire_pdu(
+                        codec_id,
+                        surface,
+                        Encoding::CHROMA,
+                        stream2,
+                        None,
+                    )),
+                );
+            }
+        }
+        (
+            Self::avc444_wire_pdu(codec_id, surface, encoding, stream1, stream2),
+            None,
+        )
+    }
+
+    /// Encode an AVC444 mixed-frame tile after its shape has been checked.
+    fn avc444_tile_pdus(
+        codec_id: Codec1Type,
+        surface: &Surface,
+        tile: &Avc444Tile,
+    ) -> (WireToSurface1Pdu, Option<WireToSurface1Pdu>) {
+        Self::avc444_wire_pdus(
             codec_id,
             surface,
             tile.encoding,
@@ -2340,20 +2385,18 @@ impl GraphicsPipelineServer {
                     }));
                 }
                 MixedTilePayload::Avc444(tile) => {
-                    self.output_queue
-                        .push_back(GfxPdu::WireToSurface1(Self::avc444_tile_pdu(
-                            Codec1Type::Avc444,
-                            surface,
-                            &tile,
-                        )));
+                    let (main_pdu, chroma_pdu) = Self::avc444_tile_pdus(Codec1Type::Avc444, surface, &tile);
+                    self.output_queue.push_back(GfxPdu::WireToSurface1(main_pdu));
+                    if let Some(chroma_pdu) = chroma_pdu {
+                        self.output_queue.push_back(GfxPdu::WireToSurface1(chroma_pdu));
+                    }
                 }
                 MixedTilePayload::Avc444v2(tile) => {
-                    self.output_queue
-                        .push_back(GfxPdu::WireToSurface1(Self::avc444_tile_pdu(
-                            Codec1Type::Avc444v2,
-                            surface,
-                            &tile,
-                        )));
+                    let (main_pdu, chroma_pdu) = Self::avc444_tile_pdus(Codec1Type::Avc444v2, surface, &tile);
+                    self.output_queue.push_back(GfxPdu::WireToSurface1(main_pdu));
+                    if let Some(chroma_pdu) = chroma_pdu {
+                        self.output_queue.push_back(GfxPdu::WireToSurface1(chroma_pdu));
+                    }
                 }
             }
         }

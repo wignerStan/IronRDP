@@ -287,50 +287,83 @@ fn avc444v2_sender_preserves_codec_and_lc_wire_shape() {
 }
 
 #[test]
-fn avc444_sender_preserves_existing_codec_and_stream_selection() {
-    let handler = Box::new(TestHandler::new());
-    let mut server = GraphicsPipelineServer::new(handler);
-    let client_caps_pdu = GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu::from_typed(&[CapabilitySet::V10 {
+fn avc444_sender_preserves_views_in_one_acknowledged_frame() {
+    let (mut server, surface_id) = mixed_frame_server(CapabilitySet::V10 {
         flags: CapabilitiesV10Flags::SMALL_CACHE,
-    }]));
-    let payload = encode_pdu(&client_caps_pdu);
-    server.process(0, &payload).expect("process capabilities");
-    let surface_id = server.create_surface(64, 64).expect("create surface");
-    server.drain_output();
+    });
+    server.set_max_frames_in_flight(1);
 
     let luma_data = [0x00, 0x00, 0x00, 0x01, 0x67];
     let chroma_data = [0x00, 0x00, 0x00, 0x01, 0x68];
-    let luma_regions = [Avc420Region::full_frame(64, 64, 22)];
-    let chroma_regions = [Avc420Region::full_frame(64, 64, 24)];
-    for (expected_encoding, second_data, second_regions) in [
-        (Encoding::LUMA, None, None),
-        (
-            Encoding::LUMA_AND_CHROMA,
-            Some(chroma_data.as_slice()),
-            Some(chroma_regions.as_slice()),
-        ),
+    let luma_regions = [Avc420Region::new(0, 0, 32, 32, 22, 80)];
+    let chroma_regions = [Avc420Region::new(16, 8, 64, 48, 24, 76)];
+    for (second_data, second_regions) in [
+        (None, None),
+        (Some(chroma_data.as_slice()), Some(chroma_regions.as_slice())),
     ] {
-        server
-            .send_avc444_frame(surface_id, &luma_data, &luma_regions, second_data, second_regions, 42)
+        let frame_id = server
+            .try_send_avc444_frame(surface_id, &luma_data, &luma_regions, second_data, second_regions, 42)
             .expect("queue AVC444 frame");
 
-        let output = server.drain_output();
-        let mut decompressor = Decompressor::new();
-        let encoded = encode_vec(output[1].as_ref()).expect("encode DVC message");
-        let mut decoded = Vec::new();
-        decompressor
-            .decompress(&encoded, &mut decoded)
-            .expect("decompress WireToSurface1");
-        let mut cursor = ReadCursor::new(&decoded);
-        let GfxPdu::WireToSurface1(wire) = GfxPdu::decode(&mut cursor).expect("decode WireToSurface1") else {
-            panic!("expected WireToSurface1");
+        let pdus = decode_drained_pdus(&mut server);
+        let has_chroma = second_data.is_some();
+        assert_eq!(pdus.len(), if has_chroma { 4 } else { 3 });
+        let GfxPdu::StartFrame(start) = &pdus[0] else {
+            panic!("expected StartFrame");
         };
-        assert_eq!(wire.codec_id, Codec1Type::Avc444);
+        assert_eq!(start.frame_id, frame_id);
+        let GfxPdu::EndFrame(end) = pdus.last().expect("EndFrame") else {
+            panic!("expected EndFrame");
+        };
+        assert_eq!(end.frame_id, frame_id);
+        assert_eq!(server.frames_in_flight(), 1);
 
-        let mut cursor = ReadCursor::new(&wire.bitmap_data);
-        let stream = Avc444BitmapStream::decode(&mut cursor).expect("decode AVC444 bitmap stream");
-        assert_eq!(stream.encoding, expected_encoding);
-        assert_eq!(stream.stream2.is_some(), expected_encoding == Encoding::LUMA_AND_CHROMA);
+        let expected_views = [
+            (Encoding::LUMA, luma_data.as_slice(), &luma_regions),
+            (Encoding::CHROMA, chroma_data.as_slice(), &chroma_regions),
+        ];
+        for (pdu, (encoding, data, regions)) in pdus[1..pdus.len() - 1].iter().zip(expected_views) {
+            let GfxPdu::WireToSurface1(wire) = pdu else {
+                panic!("expected WireToSurface1");
+            };
+            assert_eq!(wire.codec_id, Codec1Type::Avc444);
+            assert_eq!(wire.surface_id, surface_id);
+            assert_eq!(wire.destination_rectangle, regions[0].to_rectangle());
+
+            let stream = Avc444BitmapStream::decode(&mut ReadCursor::new(&wire.bitmap_data))
+                .expect("decode AVC444 bitmap stream");
+            assert_eq!(stream.encoding, encoding);
+            assert!(stream.stream2.is_none());
+            assert_eq!(stream.stream1.data, data);
+            assert_eq!(stream.stream1.rectangles, vec![regions[0].to_rectangle()]);
+            assert_eq!(stream.stream1.quant_qual_vals, vec![regions[0].to_quant_quality()]);
+            if encoding == Encoding::CHROMA {
+                assert_eq!(&wire.bitmap_data[..4], &0x80000000u32.to_le_bytes());
+            }
+        }
+
+        assert!(matches!(
+            server.try_send_avc444_frame(
+                surface_id,
+                &luma_data,
+                &luma_regions,
+                Some(&chroma_data),
+                Some(&chroma_regions),
+                43,
+            ),
+            Err(FrameSubmissionError::Backpressured {
+                frames_in_flight: 1,
+                max_frames_in_flight: 1
+            })
+        ));
+        assert!(!server.has_pending_output());
+        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            queue_depth: QueueDepth::from_u32(0),
+            frame_id,
+            total_frames_decoded: frame_id + 1,
+        });
+        server.process(0, &encode_pdu(&ack)).expect("process ACK");
+        assert_eq!(server.frames_in_flight(), 0);
     }
 }
 
@@ -686,9 +719,11 @@ fn mixed_frame_carries_avc444_tiles_next_to_clearcodec(
         .expect("queue mixed frame");
 
     let pdus = decode_drained_pdus(&mut server);
-    assert_eq!(pdus.len(), 4);
+    let split = !v2 && encoding == Encoding::LUMA_AND_CHROMA;
+    let clearcodec_index = if split { 3 } else { 2 };
+    assert_eq!(pdus.len(), clearcodec_index + 2);
     assert!(matches!(pdus[0], GfxPdu::StartFrame(_)));
-    assert!(matches!(pdus[3], GfxPdu::EndFrame(_)));
+    assert!(matches!(pdus[clearcodec_index + 1], GfxPdu::EndFrame(_)));
 
     let GfxPdu::WireToSurface1(avc444) = &pdus[1] else {
         panic!("expected AVC444 WireToSurface1");
@@ -697,14 +732,13 @@ fn mixed_frame_carries_avc444_tiles_next_to_clearcodec(
     assert_eq!(avc444.codec_id, expected_codec);
 
     let stream = Avc444BitmapStream::decode(&mut ReadCursor::new(&avc444.bitmap_data)).expect("decode AVC444");
-    assert_eq!(stream.encoding, encoding);
+    assert_eq!(stream.encoding, if split { Encoding::LUMA } else { encoding });
     assert_eq!(stream.stream1.rectangles[0].right, 32);
     assert_eq!(stream.stream1.rectangles[0].bottom, 32);
-    if encoding == Encoding::LUMA_AND_CHROMA {
+    if encoding == Encoding::LUMA_AND_CHROMA && !split {
         let stream2 = stream.stream2.expect("second sub-stream");
         assert_eq!(stream2.rectangles[0].left, 16);
         assert_eq!(stream2.rectangles[0].bottom, 48);
-        // destRect is the bounding box of both sub-streams.
         assert_eq!(avc444.destination_rectangle.right, 64);
         assert_eq!(avc444.destination_rectangle.bottom, 48);
     } else {
@@ -712,8 +746,21 @@ fn mixed_frame_carries_avc444_tiles_next_to_clearcodec(
         assert_eq!(avc444.destination_rectangle.right, 32);
         assert_eq!(avc444.destination_rectangle.bottom, 32);
     }
+    if split {
+        let GfxPdu::WireToSurface1(chroma) = &pdus[2] else {
+            panic!("expected chroma WireToSurface1");
+        };
+        assert_eq!(chroma.codec_id, Codec1Type::Avc444);
+        let stream =
+            Avc444BitmapStream::decode(&mut ReadCursor::new(&chroma.bitmap_data)).expect("decode chroma stream");
+        assert_eq!(stream.encoding, Encoding::CHROMA);
+        assert!(stream.stream2.is_none());
+        assert_eq!(stream.stream1.rectangles[0].left, 16);
+        assert_eq!(stream.stream1.rectangles[0].bottom, 48);
+        assert_eq!(chroma.destination_rectangle, stream.stream1.rectangles[0]);
+    }
 
-    let GfxPdu::WireToSurface1(clearcodec) = &pdus[2] else {
+    let GfxPdu::WireToSurface1(clearcodec) = &pdus[clearcodec_index] else {
         panic!("expected ClearCodec WireToSurface1");
     };
     assert_eq!(clearcodec.codec_id, Codec1Type::ClearCodec);
