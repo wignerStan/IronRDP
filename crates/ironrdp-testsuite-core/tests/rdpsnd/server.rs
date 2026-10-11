@@ -138,6 +138,7 @@ fn extra_data_must_match_for_otherwise_identical_formats() {
 struct Recording {
     choose_format_calls: usize,
     start_calls: usize,
+    stop_calls: usize,
     chosen_wformat: Option<u16>,
     wave_confirms: Vec<(u8, u16)>,
 }
@@ -171,7 +172,9 @@ impl RdpsndServerHandler for FakeHandler {
         }
     }
 
-    fn stop(&mut self) {}
+    fn stop(&mut self) {
+        self.rec.lock().expect("poisoned").stop_calls += 1;
+    }
 
     fn wave_confirm(&mut self, block_no: u8, timestamp: u16) {
         self.rec
@@ -461,4 +464,52 @@ fn stale_check_follows_the_u16_timestamp_wrap() {
     blocks.record(8, 0xFFF0);
     // 0x0010 is 32 ms after 0xFFF0 across the wrap.
     assert_eq!(blocks.confirm(8, 0x0010), ConfirmKind::First(0xFFF0));
+}
+
+#[test]
+fn close_stops_once_and_rejects_queued_audio() {
+    let rec = Arc::new(Mutex::new(Recording::default()));
+    let mut server = RdpsndServer::new(Box::new(FakeHandler {
+        formats: vec![fmt(WaveFormat::PCM, 44100)],
+        rec: Arc::clone(&rec),
+        start_ok: true,
+    }));
+    drive_to_ready(&mut server, vec![fmt(WaveFormat::PCM, 44100)]);
+    server.wave(vec![0; 8], 10).expect("wave before close");
+
+    let messages: Vec<_> = server.close().expect("close").into();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].encode_unframed_pdu().expect("close bytes"), [1, 0, 0, 0]);
+    assert_eq!(rec.lock().expect("poisoned").stop_calls, 1);
+    assert!(!server.is_ready());
+    assert!(server.wave(vec![0; 8], 20).is_err());
+    assert!(server.set_volume(100, 100).is_err());
+    let repeated: Vec<_> = server.close().expect("repeat close").into();
+    assert!(repeated.is_empty());
+    drop(server);
+    assert_eq!(rec.lock().expect("poisoned").stop_calls, 1);
+}
+
+#[test]
+fn formats_restart_after_close_starts_a_new_audio_stream() {
+    let rec = Arc::new(Mutex::new(Recording::default()));
+    let mut server = RdpsndServer::new(Box::new(FakeHandler {
+        formats: vec![fmt(WaveFormat::PCM, 44100)],
+        rec: Arc::clone(&rec),
+        start_ok: true,
+    }));
+    for _ in 0..2 {
+        drive_to_ready(&mut server, vec![fmt(WaveFormat::PCM, 44100)]);
+        assert!(server.is_ready());
+        let waves: Vec<_> = server.wave(vec![0; 8], 10).expect("new stream wave").into();
+        let bytes = waves[0].encode_unframed_pdu().expect("wave bytes");
+        let wave: ironrdp_rdpsnd::pdu::ServerAudioOutputPdu<'_> = ironrdp_core::decode(&bytes).expect("wave PDU");
+        assert!(matches!(wave, ironrdp_rdpsnd::pdu::ServerAudioOutputPdu::Wave(info) if info.block_no == 0));
+        let messages: Vec<_> = server.close().expect("new stream close").into();
+        assert_eq!(messages.len(), 1);
+    }
+    drop(server);
+    let rec = rec.lock().expect("poisoned");
+    assert_eq!(rec.start_calls, 2);
+    assert_eq!(rec.stop_calls, 2);
 }

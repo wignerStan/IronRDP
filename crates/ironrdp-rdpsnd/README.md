@@ -8,3 +8,5 @@ This crate is part of the [IronRDP] project.
 [MS-RDPEA]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/bea2d5cf-e3b9-4419-92e5-0e074ff9bc5b
 
 Client and server support the pre-v8 WaveInfo / bare Wave two-message path in addition to Wave2.
+
+Closing a server stream stops its producer before returning `SNDC_CLOSE`. Repeated close calls emit no packet. Waves and settings are rejected after close until formats negotiation restarts.

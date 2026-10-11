@@ -66,3 +66,5 @@ local
 `send_request` queues a probe via the server event loop. If no client has opened the ECHO channel yet, the request is dropped.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
+
+For a server-initiated disconnect, the server stops the negotiated audio producer and writes `SNDC_CLOSE` before the error notice and transport shutdown. Audio waves waiting in the same event batch are discarded. No sleep or client acknowledgement is required.

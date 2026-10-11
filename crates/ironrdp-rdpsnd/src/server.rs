@@ -307,6 +307,7 @@ pub struct RdpsndServer {
     format_no: Option<u16>,
     sent_blocks: SentBlocks,
     stats: StreamStats,
+    handler_stopped: bool,
 }
 
 impl RdpsndServer {
@@ -322,6 +323,7 @@ impl RdpsndServer {
             block_no: 0,
             sent_blocks: SentBlocks::default(),
             stats: StreamStats::default(),
+            handler_stopped: false,
         }
     }
 
@@ -366,6 +368,9 @@ impl RdpsndServer {
     }
 
     pub fn wave(&mut self, data: Vec<u8>, ts: u32) -> PduResult<RdpsndSvcMessages> {
+        if !self.is_ready() {
+            return Err(pdu_other_err!("audio stream is not ready"));
+        }
         let version = self.version()?;
         let format_no = self
             .format_no
@@ -438,6 +443,9 @@ impl RdpsndServer {
     }
 
     pub fn set_volume(&mut self, volume_left: u16, volume_right: u16) -> PduResult<RdpsndSvcMessages> {
+        if !self.is_ready() {
+            return Err(pdu_other_err!("audio stream is not ready"));
+        }
         if !self.flags()?.contains(pdu::AudioFormatFlags::VOLUME) {
             return Err(pdu_other_err!("client doesn't support volume"));
         }
@@ -451,9 +459,30 @@ impl RdpsndServer {
         ]))
     }
 
+    /// Stop the producer and emit one Close PDU for this audio stream.
+    ///
+    /// After Close, [MS-RDPEA 3.2.5.2.1.7] permits only training or formats
+    /// PDUs to restart audio. Queued waves and settings are rejected until
+    /// negotiation starts again. The backend stop hook runs before Close is
+    /// returned and is not repeated when this processor is dropped.
+    ///
+    /// [MS-RDPEA 3.2.5.2.1.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/cb7e9d2b-43cb-4109-913b-8412c3aca443
     pub fn close(&mut self) -> PduResult<RdpsndSvcMessages> {
+        if self.handler_stopped {
+            return Ok(RdpsndSvcMessages::new(vec![]));
+        }
+        self.state = RdpsndState::Stop;
+        self.format_no = None;
+        self.stop_handler();
         debug!("Sending RDPSND close");
         Ok(RdpsndSvcMessages::new(vec![pdu::ServerAudioOutputPdu::Close.into()]))
+    }
+
+    fn stop_handler(&mut self) {
+        if !self.handler_stopped {
+            self.handler_stopped = true;
+            self.handler.stop();
+        }
     }
 }
 
@@ -649,10 +678,16 @@ impl SvcProcessor for RdpsndServer {
     }
 
     fn start(&mut self) -> PduResult<Vec<SvcMessage>> {
-        if self.state != RdpsndState::Start {
+        if !matches!(self.state, RdpsndState::Start | RdpsndState::Stop) {
             error!(state = ?self.state, "Attempted to start rdpsnd channel in invalid state");
         }
 
+        self.handler_stopped = false;
+        self.client_format = None;
+        self.quality_mode = None;
+        self.format_no = None;
+        self.block_no = 0;
+        self.sent_blocks = SentBlocks::default();
         let formats = self.handler.get_formats();
         debug!(
             count = formats.len(),
@@ -674,7 +709,7 @@ impl Drop for RdpsndServer {
         if self.stats.waves_sent > 0 {
             debug!(stats = ?self.stats, "RDPSND stream ended");
         }
-        self.handler.stop();
+        self.stop_handler();
     }
 }
 

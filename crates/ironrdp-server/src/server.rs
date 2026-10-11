@@ -3349,6 +3349,36 @@ impl RdpServer {
         Ok((RunState::Continue, encoder))
     }
 
+    /// Stop this connection's audio before an error notice and transport close.
+    /// MS-RDPEA 3.2.5.2.1.7 uses Close just before disconnect and forbids
+    /// further waves. This write shares the event writer, so no wave can pass
+    /// Close while the disconnect event is being handled.
+    async fn close_connection_audio(
+        conn: &mut ConnectionState,
+        writer: &mut impl FramedWrite,
+        user_channel_id: u16,
+    ) -> ServerResult<()> {
+        let channel_id = conn.get_channel_id_by_type::<RdpsndServer>();
+        let Some(rdpsnd) = conn.get_svc_processor::<RdpsndServer>() else {
+            return Ok(());
+        };
+        let was_ready = rdpsnd.is_ready();
+        let messages = rdpsnd
+            .close()
+            .map_err_kind("close rdpsnd stream", ServerErrorKind::Pdu)?;
+        if !was_ready {
+            // Stop an unnegotiated producer without sending a premature Close.
+            return Ok(());
+        }
+        let channel_id = channel_id.ok_or_else(|| ServerError::channel("SVC channel not found"))?;
+        let bytes =
+            server_encode_svc_messages(messages.into(), channel_id, user_channel_id).map_err(ServerError::encode)?;
+        writer
+            .write_all(&bytes)
+            .await
+            .map_err(|error| ServerError::io("send rdpsnd close", error))
+    }
+
     /// `conn.client_supports_errinfo` is the client's `RNS_UD_CS_SUPPORT_ERRINFO_PDU`
     /// early-capability opt-in: MS-RDPBCGR 3.3.5.7.1 forbids sending a Server
     /// Set Error Info PDU to a client that did not set it, so the two arms below
@@ -3389,11 +3419,26 @@ impl RdpServer {
             .iter()
             .filter(|e| matches!(e, ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(..))))
             .count();
-        let mut wave_skip = wave_total.saturating_sub(WAVE_KEEP);
+        let disconnect_pending = events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::Quit(_) | ServerEvent::EvictedByOtherConnection | ServerEvent::Disconnect(_)
+            )
+        });
+        let mut wave_skip = if disconnect_pending {
+            // Audio already waiting in this batch belongs to the connection
+            // being closed. Do not start another client playback callback.
+            wave_total
+        } else {
+            wave_total.saturating_sub(WAVE_KEEP)
+        };
         for event in events.drain(..) {
             trace!(?event, "Dispatching");
             match event {
                 ServerEvent::Quit(reason) => {
+                    if let Err(error) = Self::close_connection_audio(conn, writer, user_channel_id).await {
+                        debug!(%error, "Could not close audio before disconnect");
+                    }
                     debug!("Got quit event: {reason}");
                     return Ok(RunState::Disconnect);
                 }
@@ -3402,6 +3447,9 @@ impl RdpServer {
                 // an unexpected drop and auto-reconnect (which ping-pongs
                 // against the preempting client — see the variant's docs).
                 ServerEvent::EvictedByOtherConnection => {
+                    if let Err(error) = Self::close_connection_audio(conn, writer, user_channel_id).await {
+                        debug!(%error, "Could not close audio before disconnect");
+                    }
                     debug!("evicting this connection -- another client took the session over");
                     if !conn.client_supports_errinfo {
                         // MS-RDPBCGR 3.3.5.7.1: the client did not set
@@ -3432,6 +3480,9 @@ impl RdpServer {
                     return Ok(RunState::Disconnect);
                 }
                 ServerEvent::Disconnect(error) => {
+                    if let Err(error) = Self::close_connection_audio(conn, writer, user_channel_id).await {
+                        debug!(%error, "Could not close audio before disconnect");
+                    }
                     debug!(?error, "Got disconnect event");
                     if !conn.client_supports_errinfo {
                         // Same MS-RDPBCGR 3.3.5.7.1 rule as the eviction arm.
@@ -3508,6 +3559,9 @@ impl RdpServer {
                         .ok_or_else(|| ServerError::channel("SVC channel not found"))?;
                     let data = server_encode_svc_messages(msgs.into(), channel_id, user_channel_id)
                         .map_err(ServerError::encode)?;
+                    if data.is_empty() {
+                        continue;
+                    }
                     writer
                         .write_all(&data)
                         .await
@@ -6815,5 +6869,249 @@ mod tests {
             released.load(Ordering::Relaxed),
             "the channel backends of a finished connection must be released, not held until the next client"
         );
+    }
+}
+
+#[cfg(test)]
+mod audio_disconnect_tests {
+    use core::any::TypeId;
+    use core::sync::atomic::AtomicUsize;
+
+    use ironrdp_pdu::rdp::server_error_info::RdpSpecificCode;
+    use ironrdp_rdpsnd::pdu::{
+        AudioFormat, AudioFormatFlags, ClientAudioFormatPdu, ClientAudioOutputPdu, TrainingConfirmPdu, Version,
+        WaveFormat,
+    };
+    use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
+
+    use super::*;
+
+    #[derive(Debug)]
+    struct RecordingHandler {
+        formats: Vec<AudioFormat>,
+        stopped: Arc<AtomicUsize>,
+    }
+
+    impl RdpsndServerHandler for RecordingHandler {
+        fn get_formats(&self) -> &[AudioFormat] {
+            &self.formats
+        }
+        fn choose_format<'a>(&mut self, common: &'a [NegotiatedFormat]) -> Option<&'a NegotiatedFormat> {
+            common.first()
+        }
+        fn start(&mut self, _: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.stopped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingWriter {
+        writes: Vec<Vec<u8>>,
+        fail_first: bool,
+    }
+
+    impl FramedWrite for CapturingWriter {
+        type WriteAllFut<'write>
+            = core::future::Ready<std::io::Result<()>>
+        where
+            Self: 'write;
+        fn write_all<'a>(&'a mut self, buf: &'a [u8]) -> Self::WriteAllFut<'a> {
+            self.writes.push(buf.to_vec());
+            if self.fail_first && self.writes.len() == 1 {
+                return core::future::ready(Err(std::io::Error::other("simulated close write failure")));
+            }
+            core::future::ready(Ok(()))
+        }
+    }
+
+    fn connection(stopped: Arc<AtomicUsize>, ready: bool, errinfo: bool) -> ConnectionState {
+        let format = AudioFormat {
+            format: WaveFormat::PCM,
+            n_channels: 2,
+            n_samples_per_sec: 48000,
+            n_avg_bytes_per_sec: 192000,
+            n_block_align: 4,
+            bits_per_sample: 16,
+            data: None,
+        };
+        let mut sound = RdpsndServer::new(Box::new(RecordingHandler {
+            formats: vec![format.clone()],
+            stopped,
+        }));
+        if ready {
+            sound.start().expect("announce formats");
+            let formats = ClientAudioOutputPdu::AudioFormat(ClientAudioFormatPdu {
+                version: Version::V5,
+                flags: AudioFormatFlags::empty(),
+                formats: vec![format],
+                volume_left: 0,
+                volume_right: 0,
+                pitch: 0,
+                dgram_port: 0,
+            });
+            sound
+                .process(&encode_vec(&formats).expect("format bytes"))
+                .expect("client formats");
+            let training = ClientAudioOutputPdu::TrainingConfirm(TrainingConfirmPdu {
+                timestamp: 0,
+                pack_size: 0,
+            });
+            sound
+                .process(&encode_vec(&training).expect("training bytes"))
+                .expect("training confirm");
+            assert!(sound.is_ready());
+        }
+        let mut conn = ConnectionState {
+            client_supports_errinfo: errinfo,
+            ..ConnectionState::default()
+        };
+        conn.static_channels.insert(sound);
+        conn.static_channels
+            .attach_channel_id(TypeId::of::<RdpsndServer>(), 1004);
+        conn
+    }
+
+    fn server() -> RdpServer {
+        RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build()
+    }
+
+    fn assert_close(bytes: &[u8]) {
+        let pdu: X224<SendDataIndication<'_>> = decode(bytes).expect("MCS audio PDU");
+        assert_eq!(pdu.0.channel_id, 1004);
+        let payload = pdu.0.user_data.as_ref();
+        assert_eq!(payload.len(), 12);
+        assert_eq!(&payload[..4], &4u32.to_le_bytes());
+        let audio: rdpsnd::pdu::ServerAudioOutputPdu<'_> = decode(&payload[8..]).expect("SNDC_CLOSE");
+        assert!(matches!(audio, rdpsnd::pdu::ServerAudioOutputPdu::Close));
+    }
+
+    fn assert_error(bytes: &[u8], expected: ErrorInfo) {
+        let pdu: X224<SendDataIndication<'_>> = decode(bytes).expect("MCS error PDU");
+        assert_eq!(pdu.0.channel_id, 1003);
+        let header: rdp::headers::ShareControlHeader = decode(pdu.0.user_data.as_ref()).expect("Share Control Header");
+        assert_eq!(header.pdu_source, 0);
+        match header.share_control_pdu {
+            ShareControlPdu::Data(data) => {
+                assert!(data.compression_flags.is_empty());
+                assert!(
+                    matches!(data.share_data_pdu, rdp::headers::ShareDataPdu::ServerSetErrorInfo(ServerSetErrorInfoPdu(code)) if code == expected)
+                );
+            }
+            other => panic!("expected error data, received {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fatal_disconnect_closes_audio_before_error_and_discards_queued_waves() {
+        for errinfo in [false, true] {
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let mut conn = connection(Arc::clone(&stopped), true, errinfo);
+            let error = ErrorInfo::RdpSpecificCode(RdpSpecificCode::GraphicsSubsystemFailed);
+            let mut events = vec![
+                ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(vec![0; 8], 10)),
+                ServerEvent::Disconnect(error),
+                ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(vec![0; 8], 20)),
+            ];
+            let mut writer = CapturingWriter::default();
+            let state = server()
+                .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+                .await
+                .expect("disconnect");
+            assert!(matches!(state, RunState::Disconnect));
+            assert!(events.is_empty());
+            assert_eq!(writer.writes.len(), 1 + usize::from(errinfo));
+            assert_close(&writer.writes[0]);
+            if errinfo {
+                assert_error(&writer.writes[1], error);
+            }
+            assert_eq!(stopped.load(Ordering::SeqCst), 1);
+            drop(conn);
+            assert_eq!(stopped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_audio_close_drops_later_wave_without_ending_session() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let mut conn = connection(Arc::clone(&stopped), true, true);
+        let mut events = vec![
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Close),
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Close),
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(vec![0; 8], 20)),
+        ];
+        let mut writer = CapturingWriter::default();
+        let state = server()
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("close audio");
+        assert!(matches!(state, RunState::Continue));
+        assert_eq!(writer.writes.iter().filter(|bytes| !bytes.is_empty()).count(), 1);
+        assert_close(&writer.writes[0]);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn unnegotiated_audio_is_stopped_without_a_close_packet() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let mut conn = connection(Arc::clone(&stopped), false, true);
+        let error = ErrorInfo::RdpSpecificCode(RdpSpecificCode::GraphicsSubsystemFailed);
+        let mut events = vec![ServerEvent::Disconnect(error)];
+        let mut writer = CapturingWriter::default();
+        server()
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("disconnect");
+        assert_eq!(writer.writes.len(), 1);
+        assert_error(&writer.writes[0], error);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_audio_close_does_not_replace_fatal_error() {
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let mut conn = connection(Arc::clone(&stopped), true, true);
+        let error = ErrorInfo::RdpSpecificCode(RdpSpecificCode::GraphicsSubsystemFailed);
+        let mut events = vec![ServerEvent::Disconnect(error)];
+        let mut writer = CapturingWriter {
+            fail_first: true,
+            ..CapturingWriter::default()
+        };
+        let state = server()
+            .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+            .await
+            .expect("disconnect after failed audio close");
+        assert!(matches!(state, RunState::Disconnect));
+        assert_eq!(writer.writes.len(), 2);
+        assert_error(&writer.writes[1], error);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn quit_and_eviction_close_audio_before_transport_shutdown() {
+        for event in [
+            ServerEvent::Quit("shutdown".to_owned()),
+            ServerEvent::EvictedByOtherConnection,
+        ] {
+            let stopped = Arc::new(AtomicUsize::new(0));
+            let mut conn = connection(Arc::clone(&stopped), true, false);
+            let mut events = vec![event];
+            let mut writer = CapturingWriter::default();
+            let state = server()
+                .dispatch_server_events(&mut conn, &mut events, &mut writer, 1003, 1002, None, None)
+                .await
+                .expect("disconnect");
+            assert!(matches!(state, RunState::Disconnect));
+            assert_eq!(writer.writes.len(), 1);
+            assert_close(&writer.writes[0]);
+            assert_eq!(stopped.load(Ordering::SeqCst), 1);
+        }
     }
 }
